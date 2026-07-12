@@ -14,6 +14,8 @@ matching -> energy attribution. Pure Python, no ML dependencies, runs on a Pi.
 | **`docs/nilm_load_disaggregation_spec.adoc`** | full spec (math, architecture); render with `asciidoctor -r asciidoctor-diagram` |
 | **`nilm/`** | offline core + replay harness (numpy; for tuning on exported history) |
 | **`custom_components/nilm/`** | the Home Assistant integration (stdlib only) |
+| **`docs/user-guide.md`** | entities, parameters, appliance identification, troubleshooting |
+| **`docs/development.md`** | repo layout, tests, CI, release process |
 
 ## Install in Home Assistant (HACS)
 
@@ -71,3 +73,7 @@ workflow stamps the manifest version and attaches `nilm.zip` for HACS.
 Status: M1 done (offline core: 98.6% fridge cycle recall, 99% energy accuracy,
 ~1% remainder on synthetic weeks) + v0 HA integration. Next: M2 tuning on real
 data. See `PLAN.md`.
+
+## License
+
+[MIT](LICENSE)
