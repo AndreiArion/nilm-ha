@@ -1,0 +1,781 @@
+= NILM for Home Assistant — Automatic Appliance Detection from a Single Meter
+Andrei Arion <andrei.arion@younited-credit.fr>
+v0.1, 2026-07-12
+:toc: left
+:toclevels: 3
+:sectnums:
+:stem: latexmath
+:icons: font
+:source-highlighter: rouge
+:imagesdir: images
+
+// Rendering note: diagrams use PlantUML blocks. Render with
+//   asciidoctor -r asciidoctor-diagram nilm_load_disaggregation_spec.adoc
+// or push through Kroki. Every diagram also has an ASCII fallback.
+
+== Purpose and scope
+
+This document specifies *NILM-HA*, a Home Assistant custom integration that performs
+_Non-Intrusive Load Monitoring_ (NILM, also called load disaggregation): from a **single
+whole-house meter signal** (here: Linky téléinformation `PAPP`, apparent power in VA),
+it automatically detects individual electrical consumers (fridge, water heater, kettle,
+oven…), learns their signatures, and exposes per-appliance *power* and *energy* sensors
+usable in the HA Energy dashboard.
+
+The approach specified here is **classical event-based NILM** (Hart, 1992, "Nonintrusive
+Appliance Load Monitoring"), chosen because:
+
+* it works at the ~1–10 s sampling rate that a Linky TIC feed provides;
+* it is fully explainable (every watt attributed can be traced to a detected edge);
+* it is light enough (O(1) per sample) to run inside the HA event loop on a Raspberry Pi;
+* it needs no labelled training data — it discovers clusters and asks the user to name them.
+
+Out of scope for v1 (kept as roadmap items): factorial HMM disaggregation,
+deep-learning seq2point models, per-phase three-phase support.
+
+== Input signal: what we actually have
+
+=== The Linky TIC `PAPP` feed
+
+The screenshot driving this spec shows `CompteurElectric PAPP` — the *apparent power*
+field of the Linky téléinformation (TIC). Facts that shape the whole design:
+
+[cols="1,3", options="header"]
+|===
+| Property | Consequence for the algorithm
+
+| Unit is *VA* (apparent power), not W
+| Reactive loads (motors, SMPS) read higher than their real power. Fine for
+  *detection* (edges are still edges), but energy attribution in kWh needs a
+  power-factor correction or calibration per appliance (<<energy-attribution>>).
+
+| Quantised to *integer VA*, and the meter itself rounds
+| The signal is a staircase. Sub-~5 VA loads are invisible. Set the noise floor
+  accordingly.
+
+| TIC frames arrive every ~1–2 s (historic mode) or faster (standard mode),
+  but *HA only records state changes*
+| The recorded series is *irregularly sampled*: no new point while power is constant.
+  The pipeline must resample to a uniform grid before windowed statistics
+  (<<preprocessing>>).
+
+| Single aggregate channel
+| Simultaneous switching events overlap; the matcher must tolerate missed/merged
+  edges (<<matching>>).
+|===
+
+[NOTE]
+====
+*Find your actual sampling rate first.* Run this against the recorder database
+(SQL sensor or `history` API) — the algorithm parameters in <<parameters>> are
+expressed in seconds and need the real cadence:
+
+[source,sql]
+----
+SELECT AVG(delta) FROM (
+  SELECT (julianday(s2.last_updated_ts,'unixepoch') -
+          julianday(s1.last_updated_ts,'unixepoch')) * 86400.0 AS delta
+  FROM states s1 JOIN states s2 ON s2.state_id = s1.state_id + 1
+  WHERE s1.metadata_id = (SELECT metadata_id FROM states_meta
+                          WHERE entity_id = 'sensor.compteurelectric_papp')
+);
+----
+
+If the TIC arrives via an ESPHome/Zigbee bridge, also check the bridge isn't
+throttling/deadbanding updates — for NILM you want *every* change reported
+(`force_update: true`, no `delta` filter, or a dedicated MQTT topic).
+====
+
+=== Signal model
+
+We model the aggregate signal as a sum of piecewise-constant appliance contributions
+plus noise:
+
+[latexmath]
+++++
+P(t) \;=\; b(t) \;+\; \sum_{a=1}^{A} s_a(t)\,\pi_a \;+\; \varepsilon(t)
+++++
+
+where stem:[b(t)] is the slowly-varying always-on baseline (router, standby…),
+stem:[s_a(t) \in \{0,1\}] is the state of two-state appliance stem:[a],
+stem:[\pi_a] its steady-state draw, and stem:[\varepsilon(t)] noise
+(quantisation + small fluctuating loads). Multi-state appliances (washing machine)
+are modelled as several coupled two-state components in v1.
+
+The core consequence: *all information lives in the step discontinuities*
+stem:[\Delta P] of the signal. The pipeline is therefore:
+
+.Processing pipeline (ASCII fallback)
+[listing]
+----
+ Linky TIC (PAPP, VA)
+        │  state_changed events (irregular)
+        ▼
+ ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+ │ 1. Resample  │──▶│ 2. Denoise   │──▶│ 3. Event     │──▶│ 4. Feature   │
+ │ uniform grid │   │ median filter│   │  detection   │   │  extraction  │
+ └──────────────┘   └──────────────┘   │ (CUSUM/edges)│   │ ΔP, spike, τ │
+                                       └──────────────┘   └──────┬───────┘
+                                                                  ▼
+ ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+ │ 8. HA sensors│◀──│ 7. Energy    │◀──│ 6. ON/OFF    │◀──│ 5. Online    │
+ │ per appliance│   │ attribution  │   │  matching    │   │  clustering  │
+ │ + remainder  │   │ (cycles→kWh) │   │ (FSM per     │   │ (signatures) │
+ └──────────────┘   └──────────────┘   │  cluster)    │   └──────────────┘
+                                       └──────────────┘
+----
+
+[plantuml, nilm-pipeline, svg]
+----
+@startuml
+skinparam componentStyle rectangle
+[Linky TIC\nsensor.papp] --> [Resampler\n(uniform grid)]
+[Resampler\n(uniform grid)] --> [Median filter]
+[Median filter] --> [Event detector\nCUSUM + steady-state]
+[Event detector\nCUSUM + steady-state] --> [Feature extractor\nΔP, spike, rise time]
+[Feature extractor\nΔP, spike, rise time] --> [Online clusterer\nappliance signatures]
+[Online clusterer\nappliance signatures] --> [Cycle matcher\nON↔OFF FSM]
+[Cycle matcher\nON↔OFF FSM] --> [Energy accountant]
+[Energy accountant] --> [HA entities\npower/energy/cycles]
+@enduml
+----
+
+[[preprocessing]]
+== Stage 1–2: Resampling and denoising
+
+=== Uniform resampling
+
+HA delivers `(t_i, x_i)` only on change. Rebuild a uniform grid with period
+stem:[T] (choose stem:[T] = native TIC cadence, e.g. 2 s) by zero-order hold:
+
+[latexmath]
+++++
+x[k] \;=\; x_{i}\quad \text{with } i = \max\{\,i : t_i \le kT\,\}
+++++
+
+Zero-order hold is *exact* here (the source only reports changes), unlike
+interpolation which would smear edges.
+
+=== Median filter
+
+A short median filter kills single-sample glitches without rounding step edges
+(a median preserves monotone steps — crucial, since edges are our signal):
+
+[latexmath]
+++++
+\tilde{x}[k] = \operatorname{median}\big(x[k-1], x[k], x[k+1]\big)
+++++
+
+Window 3 (one sample of protection) is enough at 2 s cadence; use 5 at 1 s.
+*Do not* use a moving average — it turns a step into a ramp and biases stem:[\Delta P].
+
+== Stage 3–4: Event detection and feature extraction
+
+Two complementary detectors run in parallel; an event is opened by either.
+
+=== Steady-state segmentation (Hart)
+
+Maintain a *steady-state* flag over a sliding window of stem:[n] samples
+(stem:[n \approx 5], i.e. ~10 s):
+
+[latexmath]
+++++
+\text{steady}[k] \iff \max_{j \in [k-n+1,k]} \tilde{x}[j] - \min_{j} \tilde{x}[j] < T_{ss}
+++++
+
+with stem:[T_{ss}] ≈ 15–25 VA for an integer-VA Linky feed. An *event* is the
+transition steady → unsteady → steady; its magnitude is the difference of the
+surrounding steady levels, estimated robustly as a difference of medians:
+
+[latexmath]
+++++
+\Delta P \;=\; \operatorname{median}\big(\tilde{x}[k_{\text{after}}\,..\,k_{\text{after}}+w]\big)
+          \;-\; \operatorname{median}\big(\tilde{x}[k_{\text{before}}-w\,..\,k_{\text{before}}]\big),
+\qquad w \approx 5
+++++
+
+This is the estimator that gives clean stem:[\Delta P] even when the transition
+contains a compressor inrush spike (the spike lies *between* the two windows).
+
+=== CUSUM change-point detector
+
+The two-sided CUSUM catches slow-onset changes the min–max test misses
+(e.g. a heater with a soft-start), and gives a principled sensitivity knob.
+With stem:[\hat\mu_k] the current steady-level estimate:
+
+[latexmath]
+++++
+\begin{aligned}
+g^{+}[k] &= \max\!\big(0,\; g^{+}[k-1] + \tilde{x}[k] - \hat\mu_k - \kappa\big)\\
+g^{-}[k] &= \max\!\big(0,\; g^{-}[k-1] - \tilde{x}[k] + \hat\mu_k - \kappa\big)\\
+\text{event} &\iff g^{+}[k] > h \;\lor\; g^{-}[k] > h
+\end{aligned}
+++++
+
+Tuning (standard results from change-point theory):
+
+* stem:[\kappa = \delta_{\min}/2] where stem:[\delta_{\min}] is the smallest jump you
+  care about (e.g. 30 VA → stem:[\kappa = 15]);
+* stem:[h \approx 4\sigma\text{–}5\sigma] where stem:[\sigma] is the steady-state noise
+  std (measure it: for integer-VA Linky typically 3–8 VA). Larger stem:[h] = fewer
+  false alarms, more detection delay (stem:[\approx h/\delta] samples).
+
+After an alarm, freeze stem:[\hat\mu], wait for steadiness, re-estimate the new level,
+reset stem:[g^{\pm}=0].
+
+=== Transient (inrush) capture — the fridge signature
+
+Your screenshot shows the classic refrigerator pattern: a *start spike*
+(compressor locked-rotor inrush, brief overshoot above the new steady level)
+followed by a flat plateau ~60–80 VA above baseline, repeating with a stable
+period. We exploit the transient as a *feature*, not a nuisance:
+
+.Fridge compressor cycle anatomy
+[listing]
+----
+ VA
+      inrush spike (0.5–2 s)
+        ╱╲
+       ╱  ╲___________________          <- plateau ΔP_ss ≈ +60..90 VA
+       │                      │
+ ______│                      │________ <- baseline
+       ↑ ON edge              ↑ OFF edge (clean step down, no spike)
+       |◀──── on-duration ────▶|
+       |◀──────────── period (μ_Δ ≈ 30–60 min) ─────────▶| next ON
+----
+
+For every event, extract the feature vector:
+
+[latexmath]
+++++
+\mathbf{f} = \Big(\;\Delta P_{ss},\;\; S = \max_{k \in \text{transient}} \tilde x[k] - P_{\text{after}},\;\;
+\tau_{\text{rise}},\;\; \sigma_{\text{transient}}\;\Big)
+++++
+
+stem:[\Delta P_{ss}]:: steady-state step (signed, VA) — the primary feature.
+stem:[S]:: spike overshoot above the settled level. Motors: large; resistive
+  loads (kettle, heater): ≈ 0.
+stem:[\tau_{\text{rise}}]:: samples from event start to settling
+  (stem:[|\tilde x - P_{\text{after}}| < T_{ss}] for stem:[n] samples).
+stem:[\sigma_{\text{transient}}]:: variability during the transition
+  (distinguishes electronically controlled loads).
+
+=== Reference implementation
+
+[source,python]
+----
+from dataclasses import dataclass, field
+from collections import deque
+from statistics import median
+
+@dataclass
+class Event:
+    t_start: float
+    t_end: float
+    dp: float            # ΔP_ss, signed VA
+    spike: float         # inrush overshoot, VA
+    rise_s: float        # settling time, s
+
+@dataclass
+class EdgeDetector:
+    """Steady-state + CUSUM hybrid edge detector. O(1) per sample."""
+    period: float = 2.0          # resample period T (s)
+    t_ss: float = 20.0           # steadiness band (VA)
+    kappa: float = 15.0          # CUSUM slack = δ_min / 2
+    h: float = 30.0              # CUSUM threshold ≈ 4-5 σ
+    win: int = 5                 # median window w
+
+    _buf: deque = field(default_factory=lambda: deque(maxlen=64))
+    _gp: float = 0.0
+    _gm: float = 0.0
+    _mu: float | None = None
+    _in_event: bool = False
+    _pre_level: float = 0.0
+    _ev_t0: float = 0.0
+    _ev_samples: list = field(default_factory=list)
+
+    def _steady(self) -> bool:
+        w = list(self._buf)[-self.win:]
+        return len(w) == self.win and max(w) - min(w) < self.t_ss
+
+    def push(self, t: float, x: float) -> Event | None:
+        self._buf.append(x)
+        if self._mu is None:
+            if self._steady():
+                self._mu = median(list(self._buf)[-self.win:])
+            return None
+
+        if not self._in_event:
+            self._gp = max(0.0, self._gp + x - self._mu - self.kappa)
+            self._gm = max(0.0, self._gm - x + self._mu - self.kappa)
+            if self._gp > self.h or self._gm > self.h or not self._steady():
+                self._in_event = True
+                self._pre_level = self._mu
+                self._ev_t0 = t
+                self._ev_samples = [x]
+            return None
+
+        # inside an event: wait for the signal to settle again
+        self._ev_samples.append(x)
+        if self._steady():
+            post = median(list(self._buf)[-self.win:])
+            dp = post - self._pre_level
+            peak = max(self._ev_samples) if dp > 0 else min(self._ev_samples)
+            ev = Event(
+                t_start=self._ev_t0, t_end=t, dp=dp,
+                spike=max(0.0, (peak - post) if dp > 0 else (post - peak)),
+                rise_s=t - self._ev_t0,
+            )
+            self._mu, self._gp, self._gm = post, 0.0, 0.0
+            self._in_event = False
+            # ignore micro-events below the noise floor
+            return ev if abs(dp) >= 2 * self.kappa else None
+        if len(self._ev_samples) > 300 / self.period:   # 5 min: give up, re-anchor
+            self._mu, self._in_event = None, False
+        return None
+----
+
+== Stage 5: Online clustering of signatures
+
+=== Feature space and normalisation
+
+Cluster ON events (stem:[\Delta P > 0]) and OFF events (stem:[\Delta P < 0]) separately.
+Power spans two orders of magnitude (60 VA fridge → 3000 VA kettle+oven), and both
+noise and appliance variability grow roughly proportionally with power, so work in
+*log-magnitude* space:
+
+[latexmath]
+++++
+\mathbf{z} = \Big( \log|\Delta P_{ss}|,\;\; \frac{S}{|\Delta P_{ss}|},\;\; \log(1+\tau_{\text{rise}}) \Big)
+++++
+
+The relative spike stem:[S/|\Delta P|] separates motor loads (fridge ≈ 0.3–2.0) from
+resistive loads (≈ 0) at equal stem:[\Delta P] — this is what distinguishes a fridge
+from, say, a 70 W lamp.
+
+=== Bootstrap: DBSCAN over the event log
+
+On first run (and nightly), cluster the accumulated event history with DBSCAN —
+it needs no cluster count and marks one-off events as noise:
+
+* stem:[\varepsilon = 0.15] in normalised stem:[\mathbf z] space
+  (≈ ±15 % power tolerance, matching appliance draw variability with mains voltage);
+* stem:[\text{minPts} = 4] — an appliance isn't a *pattern* until seen ~4 times.
+  A fridge produces ~30–50 ON events/day, so it clusters within hours.
+
+[source,python]
+----
+import numpy as np
+from sklearn.cluster import DBSCAN
+
+def cluster_events(events):                     # events: list[Event], same sign
+    Z = np.array([[np.log(abs(e.dp)),
+                   e.spike / abs(e.dp),
+                   np.log1p(e.rise_s)] for e in events])
+    Z = (Z - Z.mean(axis=0)) / (Z.std(axis=0) + 1e-9)
+    return DBSCAN(eps=0.15 * np.sqrt(Z.shape[1]), min_samples=4).fit_predict(Z)
+----
+
+=== Steady state: online nearest-centroid assignment
+
+Between re-clusterings, assign each new event to the nearest known cluster using a
+per-cluster Gaussian model stem:[(\boldsymbol\mu_c, \boldsymbol\Sigma_c)] and a
+Mahalanobis gate:
+
+[latexmath]
+++++
+d^2_c(\mathbf z) = (\mathbf z - \boldsymbol\mu_c)^{\top} \boldsymbol\Sigma_c^{-1} (\mathbf z - \boldsymbol\mu_c),
+\qquad \text{assign} \iff \min_c d^2_c < \chi^2_{3,\,0.99} \approx 11.34
+++++
+
+Events that pass the gate update the cluster with an exponential moving average
+(stem:[\alpha = 0.05], so the model tracks seasonal drift — fridges draw more in
+summer). Events that fail go to an *unassigned* buffer that feeds the nightly DBSCAN,
+which is how *new appliances are discovered automatically*.
+
+[[matching]]
+== Stage 6: ON/OFF matching — cycles
+
+Each ON-cluster is paired with the OFF-cluster of opposite, near-equal magnitude,
+then individual events are matched into *cycles* by a per-appliance two-state FSM.
+
+[plantuml, appliance-fsm, svg]
+----
+@startuml
+[*] --> OFF
+OFF --> ON : ON-edge from own cluster\n(ΔP⁺ within tolerance)
+ON --> OFF : OFF-edge with |ΔP⁻| ≈ ΔP⁺\nand duration ∈ [d_min, d_max]
+ON --> OFF : timeout d_max exceeded\n→ cycle discarded (low confidence)
+note right of ON : accumulate energy\nΔP_ss × elapsed
+@enduml
+----
+
+.ASCII fallback
+[listing]
+----
+            ON-edge (cluster match)
+   ┌─────┐ ─────────────────────────▶ ┌────┐
+   │ OFF │                            │ ON │──▶ energy += ΔP·dt
+   └─────┘ ◀───────────────────────── └────┘
+            OFF-edge with |ΔP⁻| ≈ ΔP⁺,
+            duration in [d_min, d_max]
+----
+
+=== Matching rule
+
+An OFF event at stem:[t_2] closes the cycle opened by an ON event at stem:[t_1] iff:
+
+[latexmath]
+++++
+\big|\Delta P^{+} + \Delta P^{-}\big| \;<\; \max\!\big(\epsilon_{\text{abs}},\; \epsilon_{\text{rel}}\,\Delta P^{+}\big)
+\quad\land\quad d_{\min} \le t_2 - t_1 \le d_{\max}
+++++
+
+with defaults stem:[\epsilon_{\text{abs}} = 25] VA, stem:[\epsilon_{\text{rel}} = 0.12],
+stem:[d_{\min} = 60] s, stem:[d_{\max}] = 6 h. When several pairings are possible
+(overlapping appliances), solve greedily by ascending cost:
+
+[latexmath]
+++++
+c(i,j) = \underbrace{\frac{|\Delta P_i^{+} + \Delta P_j^{-}|}{\Delta P_i^{+}}}_{\text{magnitude mismatch}}
+\;+\; \lambda \underbrace{\Big|\log\frac{t_j - t_i}{\hat d_c}\Big|}_{\text{duration vs. cluster's typical }\hat d_c},
+\qquad \lambda = 0.3
+++++
+
+Unmatched ON events expire at stem:[d_{\max}] and their energy falls into the
+*remainder* sensor — the system never invents attribution it can't defend.
+
+=== Handling simultaneous events
+
+Two appliances switching within one settling window produce a single merged edge
+stem:[\Delta P_1 + \Delta P_2]. v1 strategy: merged edges usually fail the cluster gate
+and stay unassigned (correct behaviour — no false attribution). The nightly job
+additionally attempts *edge decomposition*: test whether an unassigned
+stem:[\Delta P \approx \boldsymbol\mu_{c_1} + \boldsymbol\mu_{c_2}] for known clusters
+stem:[c_1, c_2] within combined tolerance, and if the corresponding OFF edges appear
+separately later, retro-attribute.
+
+== Stage 6b: Periodicity — auto-identifying the fridge
+
+Cyclic thermostat-driven appliances (fridge, freezer, aquarium heater) are identified
+*without any user input* from the statistics of their ON times stem:[\{t_i\}]:
+
+[latexmath]
+++++
+\Delta_i = t_{i+1} - t_i, \qquad
+\text{CV} = \frac{\operatorname{std}(\Delta_i)}{\operatorname{mean}(\Delta_i)}, \qquad
+D = \frac{\operatorname{mean}(\text{on-duration})}{\operatorname{mean}(\Delta_i)}
+++++
+
+Classification heuristics (defaults, all configurable):
+
+[cols="2,1,1,1,2", options="header"]
+|===
+| Pattern | stem:[\Delta P_{ss}] | CV | Duty stem:[D] | Verdict
+
+| Compressor cycling | 40–250 VA | < 0.35 | 0.2–0.6 | *fridge/freezer* (label suggestion)
+| High power, nightly, long | 1–3 kVA | < 0.2 (daily) | — | *water heater on off-peak (HC)*
+| High power, short, irregular | 1–2.5 kVA | > 0.6 | — | *kettle / microwave*
+| Motor spike + 30–120 min run | 300–800 VA | > 0.6 | — | *washing machine component*
+|===
+
+A robustness refinement: compute CV on the *median absolute deviation* rather than
+std, and window the statistics per 24 h — fridge periods differ day/night (door
+openings) but stay tight within a window. Optionally confirm periodicity with the
+autocorrelation of the binarised state signal stem:[s_c[k]]: a periodic appliance
+shows a clear secondary peak at lag stem:[\approx \mu_\Delta].
+
+[[energy-attribution]]
+== Stage 7: Energy attribution
+
+Per closed cycle, attribute energy by rectangle rule (the plateau is flat by
+construction — that's what "steady state" means):
+
+[latexmath]
+++++
+E_{\text{cycle}} = \Delta P_{ss} \cdot (t_2 - t_1) \cdot \text{PF}_c \;/\; 3.6{\times}10^{6} \quad [\text{kWh}]
+++++
+
+`PF~c~` is a per-cluster power-factor estimate, default 1.0 (resistive), 0.8 for
+clusters flagged as motor loads (spike ratio > 0.2). If the TIC also exposes an
+energy index (`BASE`/`EAST`, Wh), calibrate: scale all stem:[\text{PF}_c] so that
+stem:[\sum_a E_a + E_{\text{baseline}} + E_{\text{remainder}}] matches the index
+delta over 24 h.
+
+Baseline (always-on) is estimated as a rolling low quantile, robust to the fact that
+the fridge is sometimes on:
+
+[latexmath]
+++++
+b(t) = Q_{0.01}\big(\tilde x[k] : t - 24\text{h} \le kT \le t\big)
+++++
+
+and the remainder — the honesty metric of the whole system — is:
+
+[latexmath]
+++++
+P_{\text{rest}}(t) = P(t) - b(t) - \sum_{c\,:\,\text{ON}} \Delta P_{ss,c}
+++++
+
+A healthy installation should see the remainder's daily energy share *decrease over
+the first weeks* as clusters are discovered; it is exposed as a sensor and is the
+primary quality KPI (<<validation>>).
+
+== Home Assistant integration architecture
+
+A pure-Python `custom_components/nilm/` integration, HACS-installable.
+Only stdlib + numpy at runtime; scikit-learn is optional (the nightly DBSCAN has a
+~40-line pure-numpy fallback since we cluster ≤ a few thousand 3-D points).
+
+[plantuml, nilm-ha-architecture, svg]
+----
+@startuml
+skinparam componentStyle rectangle
+package "Home Assistant Core" {
+  [Recorder / State machine] as SM
+  [Energy dashboard] as ED
+}
+package "custom_components/nilm" {
+  [Config & Options Flow] as CF
+  [NilmCoordinator\n(listener + resampler)] as CO
+  [EdgeDetector] as DET
+  [ClusterStore\n(.storage/nilm)] as ST
+  [CycleMatcher FSMs] as FSM
+  [Nightly job\n(DBSCAN + calibration)] as NJ
+  [Entities:\npower_x / energy_x /\nremainder / baseline] as EN
+  [Services:\nlabel, merge, reset] as SV
+}
+SM -> CO : async_track_state_change_event(sensor.papp)
+CO -> DET : uniform samples (T=2s)
+DET -> FSM : Event(ΔP, spike, τ)
+FSM -> ST : cycles, cluster stats
+NJ -> ST : re-cluster, PF calibration
+ST -> EN : models
+EN -> SM : states
+EN -> ED : energy sensors (total_increasing)
+SV -> ST : user labels
+@enduml
+----
+
+.Runtime data flow (sequence)
+[plantuml, nilm-sequence, svg]
+----
+@startuml
+participant "sensor.papp" as P
+participant Coordinator as C
+participant EdgeDetector as D
+participant "Matcher (FSM)" as M
+participant "power_fridge /\nenergy_fridge" as S
+P -> C : state_changed (irregular)
+loop every T = 2 s
+  C -> D : push(t, x)  (zero-order hold)
+end
+D --> C : Event(ΔP=+72 VA, spike=210, τ=4s)
+C -> M : classify + feed FSM
+M -> M : cluster #3 → state ON
+M -> S : power = 72 VA
+... 40 min later ...
+D --> C : Event(ΔP=-71 VA)
+M -> S : power = 0, energy += 0.048 kWh
+@enduml
+----
+
+=== File layout
+
+[listing]
+----
+custom_components/nilm/
+├── __init__.py          # setup, coordinator wiring
+├── manifest.json        # {"domain":"nilm", "iot_class":"calculated",
+│                        #  "requirements":["numpy>=1.24"], ...}
+├── config_flow.py       # pick source entity, sensitivity preset
+├── const.py
+├── coordinator.py       # listener, resampler, detector loop
+├── detector.py          # EdgeDetector (section 4.4, no HA imports → unit-testable)
+├── clustering.py        # online gate + nightly DBSCAN (no HA imports)
+├── matcher.py           # per-cluster FSM, cycle log (no HA imports)
+├── storage.py           # helpers.storage.Store wrapper, schema v1
+├── sensor.py            # dynamic per-cluster entities
+├── services.yaml        # label_appliance, merge_clusters, reset_model
+└── translations/
+----
+
+Keeping `detector.py`, `clustering.py`, `matcher.py` free of HA imports makes the
+whole signal chain unit-testable against CSV exports of your recorder history —
+see <<validation>>.
+
+=== Coordinator skeleton
+
+[source,python]
+----
+# coordinator.py
+from __future__ import annotations
+from homeassistant.core import HomeAssistant, Event as HaEvent, callback
+from homeassistant.helpers.event import (
+    async_track_state_change_event, async_track_time_interval)
+from datetime import timedelta
+from .detector import EdgeDetector
+from .matcher import CycleMatcher
+from .clustering import ClusterModel
+
+class NilmCoordinator:
+    def __init__(self, hass: HomeAssistant, entry) -> None:
+        self.hass = hass
+        self.source = entry.data["source_entity"]        # sensor.compteurelectric_papp
+        self.period = entry.options.get("period", 2.0)
+        self.detector = EdgeDetector(period=self.period, **entry.options.get("detector", {}))
+        self.clusters = ClusterModel.from_store(hass, entry.entry_id)
+        self.matcher = CycleMatcher(self.clusters)
+        self._last: float | None = None
+
+    async def async_start(self) -> None:
+        self._unsub_state = async_track_state_change_event(
+            self.hass, [self.source], self._on_state)
+        self._unsub_tick = async_track_time_interval(
+            self.hass, self._tick, timedelta(seconds=self.period))
+
+    @callback
+    def _on_state(self, event: HaEvent) -> None:
+        if (s := event.data.get("new_state")) and s.state not in ("unknown", "unavailable"):
+            try:
+                self._last = float(s.state)
+            except ValueError:
+                pass
+
+    @callback
+    def _tick(self, now) -> None:                       # zero-order hold resampler
+        if self._last is None:
+            return
+        if ev := self.detector.push(now.timestamp(), self._last):
+            cluster_id = self.clusters.assign(ev)       # None → unassigned buffer
+            for update in self.matcher.feed(ev, cluster_id):
+                self.async_notify_entities(update)      # power/energy/remainder
+----
+
+=== Entities
+
+Per discovered cluster stem:[c] (created dynamically, named `nilm_appliance_3` until
+the user labels it via the `nilm.label_appliance` service or a repair-style prompt):
+
+[cols="2,1,1,3", options="header"]
+|===
+| Entity | Class | Unit | Notes
+
+| `sensor.nilm_<name>_power` | `apparent_power` | VA | stem:[\Delta P_{ss,c}] while ON, else 0
+| `sensor.nilm_<name>_energy` | `energy`, `total_increasing` | kWh | Energy-dashboard ready
+| `binary_sensor.nilm_<name>_running` | `running` | — | FSM state; automation-friendly
+| `sensor.nilm_<name>_cycles_today` | — | cycles | Fridge health monitoring
+| `sensor.nilm_baseline_power` | `apparent_power` | VA | rolling stem:[Q_{0.01}]
+| `sensor.nilm_remainder_power` / `_energy` | — | VA / kWh | unattributed; quality KPI
+| `sensor.nilm_unassigned_events_24h` | — | events | discovery backlog indicator
+|===
+
+Attributes on each appliance sensor expose the model for transparency:
+`delta_p`, `spike_ratio`, `typical_duration`, `period_cv`, `duty_cycle`,
+`confidence`, `auto_label` (e.g. `"fridge?"`), `first_seen`, `cycles_total`.
+
+=== Persistence
+
+`helpers.storage.Store("nilm.<entry_id>", version=1)` holding:
+
+[source,json]
+----
+{
+  "clusters": [
+    {"id": 3, "label": "Fridge", "auto_label": "fridge?",
+     "mu": [4.28, 0.42, 1.6], "sigma": [[...]], "n": 412,
+     "delta_p": 72.4, "pf": 0.8, "typ_duration_s": 2350,
+     "period_cv": 0.21, "duty": 0.44, "energy_total_kwh": 41.7}
+  ],
+  "unassigned": [ {"t": 1783969200.0, "dp": 1840.0, "spike": 0.0, "rise": 2.1} ],
+  "open_cycles": [ {"cluster": 3, "t_on": 1783971000.0, "dp": 71.9} ]
+}
+----
+
+Event history for the nightly DBSCAN is *not* duplicated — it is re-read from the
+HA recorder (or kept as a bounded 30-day deque in the store, ≈ 100 kB).
+
+[[parameters]]
+== Tunable parameters (defaults)
+
+[cols="2,1,1,4", options="header"]
+|===
+| Parameter | Default | Unit | Meaning / how to tune
+
+| `period` (T) | 2 | s | Resample grid. Set to native TIC cadence; never below it.
+| `t_ss` | 20 | VA | Steadiness band. ≈ 3–4× steady-state noise std.
+| `kappa` | 15 | VA | CUSUM slack = half the smallest jump of interest (30 VA).
+| `h` | 30 | VA·samples | CUSUM threshold ≈ 4–5 σ. Raise if false events at night.
+| `win` | 5 | samples | Median window for level estimation (10 s @ T=2 s).
+| `eps` | 0.15 | — | DBSCAN radius in normalised space (≈ ±15 % power).
+| `min_pts` | 4 | events | Occurrences before a cluster exists.
+| `gate` | 11.34 | — | Mahalanobis χ²(3 dof, 99 %).
+| `eps_abs`, `eps_rel` | 25, 0.12 | VA, — | ON/OFF magnitude match tolerance.
+| `d_min`, `d_max` | 60, 21600 | s | Plausible cycle duration bounds.
+| `alpha` | 0.05 | — | EMA rate for cluster drift tracking.
+|===
+
+The config flow exposes three presets (*sensitive / balanced / conservative*) that
+scale `t_ss`, `kappa`, `h` together; the options flow exposes everything.
+
+[[validation]]
+== Validation plan
+
+. *Offline replay first.* Export 2–4 weeks of `sensor.compteurelectric_papp` history
+  to CSV; run `detector.py → clustering.py → matcher.py` as a plain script
+  (`python -m nilm.replay history.csv`). Iterate on parameters where a run takes
+  seconds, not days.
+. *Ground truth for 2–3 appliances.* A single smart plug with power monitoring
+  (e.g. on the fridge for one week) gives cycle-level truth. Metrics:
+  event *precision/recall* (a detected ON within ±30 s of a true ON), and energy
+  error stem:[|E_{\text{nilm}} - E_{\text{plug}}| / E_{\text{plug}}] (target < 15 %).
+. *Conservation check (always on).* Daily:
+  stem:[E_{\text{index}} = E_{\text{base}} + \sum_a E_a + E_{\text{rest}}] within 2 %
+  (it is an identity up to PF calibration — deviation means a bug).
+. *Remainder trend.* Remainder share of daily energy should drop below ~30 %
+  after two weeks on a typical home; plot it on the dashboard.
+. *Unit tests* on synthetic signals: single step, step+inrush, two overlapping
+  appliances, missing samples, meter restart (state → `unavailable`).
+
+== Known limitations (v1)
+
+* *VA vs W*: attribution is in VA-derived kWh with a crude PF correction; absolute
+  kWh per appliance carries ±10–20 % error until calibrated against the meter index.
+* *Variable-power appliances* (induction hob, dimmed lights, heat-pump inverter — a
+  ramp, not a step) are structurally invisible to an edge detector; they land in the
+  remainder. This is the main motivation for the FHMM/deep-learning roadmap items.
+* *Multi-state machines* (washing machine, dishwasher) appear as several independent
+  clusters; grouping them into one logical appliance is a v2 feature
+  (co-occurrence analysis of clusters within a 3 h window).
+* *Merged simultaneous edges* are conservatively left unattributed (by design).
+* Slow HA recording (minute-level, or a deadband upstream) degrades everything:
+  inrush spikes vanish and small appliances blur. Fix the data feed before tuning.
+
+== Roadmap
+
+[cols="1,4", options="header"]
+|===
+| Version | Content
+
+| v1.0 | Everything specified above: edge detection, clustering, FSM matching,
+         periodicity auto-labels, energy sensors, replay tool.
+| v1.1 | Merged-edge decomposition; cluster co-occurrence grouping (multi-state
+         appliances); repair-flow prompts "New appliance detected (≈1900 VA,
+         evenings) — name it?".
+| v2.0 | FHMM disaggregation of the remainder (per-cluster HMMs learned from v1
+         cycles as priors), giving attribution for variable loads.
+| v2.x | Optional seq2point neural model trained per-home from v1 pseudo-labels
+         (research direction; NILMTK-compatible export for experimentation).
+|===
+
+== References
+
+* G. W. Hart, _Nonintrusive Appliance Load Monitoring_, Proc. IEEE, 80(12), 1992 —
+  the founding event-based NILM paper; this spec is essentially "Hart + inrush
+  features + online clustering".
+* M. Basseville, I. Nikiforov, _Detection of Abrupt Changes_, 1993 — CUSUM tuning.
+* N. Batra et al., _NILMTK: An Open Source Toolkit for Non-intrusive Load
+  Monitoring_, e-Energy 2014 — dataset formats and evaluation metrics.
+* C. Zhang et al., _Sequence-to-Point Learning for NILM_, AAAI 2018 — the v2.x path.
+* Enedis, _Sorties de télé-information client des appareils de comptage Linky_
+  (Enedis-NOI-CPT_54E) — TIC frame reference (`PAPP`, `BASE`, `HCHC/HCHP`).

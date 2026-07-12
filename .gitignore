@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*_nilm/
+synth*.csv
+*_truth.json
