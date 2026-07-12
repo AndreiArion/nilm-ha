@@ -12,7 +12,7 @@ signature clustering → ON/OFF cycle matching → energy attribution.
 
 ## Current status (update me!)
 
-**Last updated: 2026-07-12 — Milestone M1 done, waiting on real data (M0 step 3).**
+**Last updated: 2026-07-12 (b) — M1 done + v0 HA integration & CI/HACS infra pushed. Waiting on real data (M0).**
 
 ## Hardware / data context
 
@@ -58,7 +58,14 @@ signature clustering → ON/OFF cycle matching → energy attribution.
 - [ ] Freeze parameter set → record here: ______
 
 ### M3 — HA custom integration (spec §9)
-- [ ] Skeleton: manifest.json, config_flow (pick source entity + preset), coordinator
+- [x] v0 skeleton shipped 2026-07-12: manifest, config_flow (entity + thresholds),
+      coordinator (listener/ZOH/detector), online model (`online.py`: streaming
+      cluster assignment + cycle FSM + baseline), sensors (baseline, attributed,
+      remainder, events, dynamic per-appliance power/energy), Store persistence,
+      translations. Stdlib-only. NOT yet field-tested in a live HA.
+- [x] CI: ruff + pytest + hassfest + HACS validation (.github/workflows/ci.yml)
+- [x] Release pipeline: tag vX.Y.Z release -> manifest stamped, nilm.zip attached
+- [x] hacs.json (zip_release) — install via HACS custom repository
 - [ ] Port M2-frozen core (detector/clustering/matcher unchanged — no HA imports)
 - [ ] Online clustering (Mahalanobis gate + EMA drift, spec §5.3) instead of batch DBSCAN
 - [ ] Nightly re-cluster job + storage (`helpers.storage.Store`, schema in spec §9.5)
@@ -101,18 +108,28 @@ Quick self-test without real data:
 | 2026-07-12 | Classical event-based NILM, not ML | works at 5 s cadence, explainable, no training data |
 | 2026-07-12 | HA custom integration (pure Python + numpy) | user choice; HACS-installable |
 | 2026-07-12 | Build offline core + replay before HA wrapper | iterate on algorithms in seconds, not days |
-| 2026-07-12 | Spike feature EXCLUDED from cluster distance (weight 0) | at 5 s the 1–2 s inrush is captured stochastically → was splitting the fridge into 3 clusters. Revisit at 1–2 s / 1 VA feed |
+| 2026-07-12 | Spike feature EXCLUDED from cluster distance | at 5 s the 1–2 s inrush is captured stochastically → was splitting the fridge into 3 clusters. Revisit at 1–2 s / 1 VA feed |
+| 2026-07-12 | Fixed physical feature scales, NOT z-scoring (log dP scale 0.15) | z-scores explode when a feature is near-constant in a batch (std≈0) → split heater OFF cluster. Fixed scales = predictable ±15% power tolerance |
+| 2026-07-12 | HA integration is stdlib-only (no numpy) | avoids install issues on HA OS; numpy stays in the offline replay tooling |
+| 2026-07-12 | d_max 6h→8h | water heater runs exactly 6 h → boundary misses |
 | 2026-07-12 | ZOH resampling, median-3 filter, no moving average | exact for change-only data; preserves edges |
 
 ## Parameters (current defaults, for 5 s / 10 VA-quantised feed)
 
 detector: period=5, t_ss=25 VA, kappa=15, h=30, win=5, max_transition=300 s
 clustering: eps=0.4 (z-scored space), min_pts=4, feature_weights=(1.0, 0, 0.3)
-matcher: eps_abs=25 VA, eps_rel=0.12, d_min=60 s, d_max=6 h
+matcher: eps_abs=25 VA, eps_rel=0.12, d_min=60 s, d_max=8 h
+online (HA integration): REL_TOL=0.15, established at n>=4, EMA alpha=0.05
 After mode standard (1 VA): try t_ss≈8, kappa≈10, h≈20, and spike weight 0.3–0.5.
 
 ## Session log
 
+- **2026-07-12 (b)**: v0 HA integration (custom_components/nilm), HACS config,
+  CI (ruff/pytest/hassfest/HACS) + release zip pipeline, 10 unit/regression tests.
+  Clustering hardened: fixed feature scales replace z-scoring (heater-split bug);
+  d_max 8h. Known: DBSCAN chaining can merge kettle(1850)+heater(2200) when an
+  intermediate event bridges them → M2 duration-based split. 3-day windows leave
+  the heater unclustered (only 3 occurrences < min_pts=4) — expected, needs ≥1 week.
 - **2026-07-12**: Spec written (`nilm_load_disaggregation_spec.adoc`). Diagnosed
   60 s/10 VA feed → fixed Z2M reporting to 5 s/1 VA (10 VA remains, meter-side).
   Confirmed PAPP is RP (reportable) on ZLinky — poll settings irrelevant to it.

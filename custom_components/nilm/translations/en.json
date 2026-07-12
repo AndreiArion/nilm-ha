@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "NILM Load Disaggregation",
+        "description": "Point NILM at your whole-house power sensor (e.g. Linky PAPP). Defaults suit a 5 s, 10 VA-quantised feed.",
+        "data": {
+          "source_entity": "Meter power sensor (VA or W)",
+          "period": "Sampling period",
+          "t_ss": "Steadiness band (t_ss)",
+          "kappa": "CUSUM slack (kappa)",
+          "h": "CUSUM threshold (h)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This sensor is already configured"
+    }
+  }
+}

@@ -57,26 +57,26 @@ class Cluster:
         return self.spike_ratio > 0.2
 
 
-# Feature weights: ΔP dominates. Spike is EXCLUDED from the distance (weight 0):
-# at ~5 s sampling a 1-2 sample inrush is only *sometimes* captured (median
-# filter, sample phase), and a stochastic feature must not split an appliance
-# into several clusters. It remains in Cluster stats & auto-labelling.
-# Revisit (e.g. 0.3-0.5) once the feed is 1-2 s / 1 VA (Linky mode standard).
-FEATURE_WEIGHTS = np.array([1.0, 0.0, 0.3])
+# Fixed feature scales (natural units), NOT per-dataset z-scoring: z-scores
+# explode when a feature is near-constant in a batch (std ~ 0) and split real
+# clusters. Scales define "1 eps" of distance per feature:
+#   log|dP|:   0.15  -> +/-15% power tolerance (mains-voltage variability)
+#   spike:     excluded (stochastic at >=5 s sampling; kept in stats/labels)
+#   log1p(t):  1.0   -> factor ~e in settle time
+FEATURE_SCALES = np.array([0.15, np.inf, 1.0])
 
 
-def cluster_events(events: list[Event], eps: float = 0.4, min_pts: int = 4
+def cluster_events(events: list[Event], eps: float = 1.0, min_pts: int = 4
                    ) -> tuple[list[Cluster], np.ndarray]:
     """Cluster same-sign events. Returns (clusters, labels aligned to events)."""
     if not events:
         return [], np.array([], dtype=int)
-    Z = features(events)
-    mu, sd = Z.mean(axis=0), Z.std(axis=0) + 1e-9
-    labels = dbscan((Z - mu) / sd * FEATURE_WEIGHTS, eps, min_pts)
+    Z = features(events) / FEATURE_SCALES
+    labels = dbscan(Z, eps, min_pts)
     sign = 1 if events[0].dp > 0 else -1
     clusters = []
     for c in sorted(set(labels) - {-1}):
-        idx = [i for i, l in enumerate(labels) if l == c]
+        idx = [i for i, lab in enumerate(labels) if lab == c]
         evs = [events[i] for i in idx]
         clusters.append(Cluster(
             cid=c, sign=sign,

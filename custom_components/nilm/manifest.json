@@ -1,0 +1,11 @@
+{
+  "domain": "nilm",
+  "name": "NILM Load Disaggregation",
+  "codeowners": ["@AndreiArion"],
+  "config_flow": true,
+  "documentation": "https://github.com/AndreiArion/nilm-ha",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/AndreiArion/nilm-ha/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

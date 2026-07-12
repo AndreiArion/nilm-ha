@@ -1,0 +1,7 @@
+{
+  "name": "NILM Load Disaggregation",
+  "homeassistant": "2024.6.0",
+  "zip_release": true,
+  "filename": "nilm.zip",
+  "render_readme": true
+}

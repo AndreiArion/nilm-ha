@@ -63,12 +63,12 @@ def match_cycles(on_events: list[Event], off_events: list[Event],
                  on_labels: np.ndarray, off_labels: np.ndarray,
                  pairs: dict[int, int],
                  eps_abs: float = 25.0, eps_rel: float = 0.12,
-                 d_min: float = 60.0, d_max: float = 6 * 3600.0
+                 d_min: float = 60.0, d_max: float = 8 * 3600.0
                  ) -> tuple[list[Cycle], list[Event]]:
     """Greedy chronological FSM matching (spec §6.2). Returns (cycles, orphans)."""
     stream: list[tuple[float, Event, int]] = (
-        [(e.t_start, e, int(l)) for e, l in zip(on_events, on_labels)] +
-        [(e.t_start, e, int(l)) for e, l in zip(off_events, off_labels)]
+        [(e.t_start, e, int(lab)) for e, lab in zip(on_events, on_labels)] +
+        [(e.t_start, e, int(lab)) for e, lab in zip(off_events, off_labels)]
     )
     stream.sort(key=lambda r: r[0])
     off_to_on = {v: k for k, v in pairs.items()}
